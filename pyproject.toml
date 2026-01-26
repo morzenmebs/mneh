@@ -1,0 +1,26 @@
+[project]
+name = "mneh"
+version = "0.1.0"
+description = "Automated semantic knowledge management"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "anthropic>=0.76.0",
+    "httpx>=0.28.1",
+    "sqlite-vec>=0.1.6",
+    "trafilatura>=2.0.0",
+]
+
+[dependency-groups]
+dev = [
+    "pyright>=1.1.408",
+    "pytest>=9.0.2",
+    "ruff>=0.14.14",
+]
+
+[tool.pyright]
+venvPath = "."
+venv = ".venv"
+
+[tool.ruff]
+line-length = 100
