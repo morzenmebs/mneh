@@ -23,7 +23,7 @@ _STOPWORDS = {
 
 
 def extract_query_terms(query: str) -> list[str]:
-    """Cheap keywordization for highlighting.
+    r"""Cheap keywordization for highlighting.
 
     Keeps \w+ tokens, lowercases, drops stopwords and very short tokens.
     """

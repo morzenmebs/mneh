@@ -61,8 +61,10 @@ def main():
 
     args = parser.parse_args()
 
-    # Ensure dirs exist
-    args.db.parent.mkdir(parents=True, exist_ok=True)
+    # Ensure dirs exist for commands that actually use the DB
+    db_path = getattr(args, "db", None)
+    if db_path is not None:
+        db_path.parent.mkdir(parents=True, exist_ok=True)
 
     if args.command == "capture":
         args.storage.mkdir(parents=True, exist_ok=True)
