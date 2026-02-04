@@ -7,10 +7,11 @@ SYSTEM_PROMPT = """Extract metadata and topic descriptors from documents for sem
 
 RULES:
 - Each topic MUST be 75-150 words. Count carefully.
-- Output 1 topic unless the document covers genuinely distinct subjects (most need only 1-2)
+- Default to 1 topic for focused documents
+- BUT: if the document applies ideas across 3+ distinct domains (e.g., game theory AND academic publishing AND AI safety AND economics), create separate topics for each domain cluster so they retrieve independently
 - Topics should be keyword-rich for search, not narrative summaries
 - Include specific terms, names, concepts, and jargon someone searching would use
-- Use provided hints if they seem accurate; infer from URL if author/site is obvious (e.g., paulgraham.com → Paul Graham)
+- Use provided hints if they seem accurate; infer from URL if author/site is obvious
 - If metadata isn't clearly present and can't be inferred, use null
 
 EXAMPLES:
