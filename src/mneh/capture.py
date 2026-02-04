@@ -4,7 +4,14 @@ import json
 import trafilatura
 from pathlib import Path
 
-from .storage import connect, store_capture, store_metadata, store_embedding
+from .storage import (
+    connect,
+    store_capture,
+    store_chunks,
+    store_embedding,
+    store_handles,
+    store_metadata,
+)
 from .extract import extract_metadata
 from .embed import embed_texts
 from .chunk import chunk_text
@@ -42,29 +49,34 @@ def capture_url(db_path: Path, url: str, storage_dir: Path) -> str:
     })
     
     store_metadata(
-        conn, h,
+        conn,
+        h,
         title=meta.get("title"),
         author=meta.get("author"),
         date=meta.get("date"),
-        topics=meta.get("topics"),
+        topics=None,
+        summary=meta.get("summary"),
     )
     
     # Chunk
     chunks = chunk_text(text)
+    store_chunks(conn, h, chunks)
+
+    handles = meta.get("handles") or []
+    store_handles(conn, h, handles, style="llm")
     
     # Embed everything in one batch
-    topics = meta.get("topics", [])
-    texts_to_embed = topics + chunks
+    texts_to_embed = handles + chunks
     
     if texts_to_embed:
         vectors = embed_texts(texts_to_embed)
         
-        # Store topic embeddings
-        for i, vec in enumerate(vectors[:len(topics)]):
-            store_embedding(conn, h, "topic", vec)
-        
+        # Store handle embeddings
+        for i, vec in enumerate(vectors[: len(handles)]):
+            store_embedding(conn, h, "handle", vec, chunk_index=i)
+
         # Store chunk embeddings
-        for i, vec in enumerate(vectors[len(topics):]):
+        for i, vec in enumerate(vectors[len(handles) :]):
             store_embedding(conn, h, "chunk", vec, chunk_index=i)
     
     return h
