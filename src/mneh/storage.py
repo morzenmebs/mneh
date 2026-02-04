@@ -29,6 +29,7 @@ def _init_schema(conn: sqlite3.Connection) -> None:
             title TEXT,
             author TEXT,
             date TEXT,
+            topics_json TEXT,
             extracted_at TEXT DEFAULT CURRENT_TIMESTAMP
         );
 
@@ -46,7 +47,49 @@ def _init_schema(conn: sqlite3.Connection) -> None:
             content='chunks',
             content_rowid='id'
         );
+
+        CREATE TABLE IF NOT EXISTS embeddings (
+            id INTEGER PRIMARY KEY,
+            hash TEXT REFERENCES captures(hash),
+            kind TEXT,  -- 'topic', 'chunk', 'full'
+            chunk_index INTEGER,  -- null for topic/full
+            vector BLOB
+        );
     """)
+    conn.commit()
+
+
+def store_metadata(
+    conn: sqlite3.Connection,
+    hash: str,
+    title: str | None = None,
+    author: str | None = None,
+    date: str | None = None,
+    topics: list[str] | None = None,
+) -> None:
+    """Store extracted metadata for a capture."""
+    import json
+    conn.execute(
+        "INSERT OR REPLACE INTO metadata (hash, title, author, date, topics_json) VALUES (?, ?, ?, ?, ?)",
+        (hash, title, author, date, json.dumps(topics) if topics else None),
+    )
+    conn.commit()
+
+
+def store_embedding(
+    conn: sqlite3.Connection,
+    hash: str,
+    kind: str,
+    vector: list[float],
+    chunk_index: int | None = None,
+) -> None:
+    """Store an embedding vector."""
+    import struct
+    blob = struct.pack(f"{len(vector)}f", *vector)
+    conn.execute(
+        "INSERT INTO embeddings (hash, kind, chunk_index, vector) VALUES (?, ?, ?, ?)",
+        (hash, kind, chunk_index, blob),
+    )
     conn.commit()
 
 
@@ -74,20 +117,6 @@ def store_capture(
     conn.commit()
     return h
 
-
-def store_metadata(
-    conn: sqlite3.Connection,
-    hash: str,
-    title: str | None = None,
-    author: str | None = None,
-    date: str | None = None,
-) -> None:
-    """Store extracted metadata for a capture."""
-    conn.execute(
-        "INSERT OR REPLACE INTO metadata (hash, title, author, date) VALUES (?, ?, ?, ?)",
-        (hash, title, author, date),
-    )
-    conn.commit()
 
 
 def search_fts(conn: sqlite3.Connection, query: str) -> list[dict]:
