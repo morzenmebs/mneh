@@ -6,8 +6,6 @@ This module owns:
 - retrieval helpers (FTS + vector KNN + RRF fusion)
 
 Vector search uses the `sqlite-vec` extension.
-
-Python binding docs show how to load the extension via `sqlite_vec.load(conn)`.
 https://alexgarcia.xyz/sqlite-vec/python.html
 """
 
@@ -18,12 +16,10 @@ import json
 import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 
-# OpenAI text-embedding-3-large has 3072 dimensions.
-# We keep this here so we can validate vectors and serialize consistently.
-EMBEDDING_DIM = 3072
+EMBEDDING_DIM = 3072  # text-embedding-3-large
 
 
 def connect(db_path: Path) -> sqlite3.Connection:
@@ -36,19 +32,14 @@ def connect(db_path: Path) -> sqlite3.Connection:
 
 
 def _load_sqlite_vec(conn: sqlite3.Connection) -> None:
-    """Attempt to load sqlite-vec (optional).
-
-    If the extension isn't available (e.g., during minimal test environments),
-    we keep going—FTS and capture still work.
-    """
+    """Attempt to load sqlite-vec (optional)."""
     try:
-        import sqlite_vec  # type: ignore
+        import sqlite_vec
 
         conn.enable_load_extension(True)
-        sqlite_vec.load(conn)  # registers SQL functions like vec_distance_cosine
+        sqlite_vec.load(conn)
         conn.enable_load_extension(False)
     except Exception:
-        # Intentionally swallow: vector search will fail loudly if called.
         try:
             conn.enable_load_extension(False)
         except Exception:
@@ -56,8 +47,7 @@ def _load_sqlite_vec(conn: sqlite3.Connection) -> None:
 
 
 def _init_schema(conn: sqlite3.Connection) -> None:
-    """Create tables if they don't exist (and evolve gently)."""
-
+    """Create tables if they don't exist."""
     conn.executescript(
         """
         CREATE TABLE IF NOT EXISTS captures (
@@ -110,8 +100,8 @@ def _init_schema(conn: sqlite3.Connection) -> None:
         CREATE TABLE IF NOT EXISTS embeddings (
             id INTEGER PRIMARY KEY,
             hash TEXT REFERENCES captures(hash),
-            kind TEXT,  -- 'handle', 'chunk', (future: 'claim')
-            chunk_index INTEGER,  -- for 'chunk': chunk_index; for 'handle': handle_index
+            kind TEXT,
+            chunk_index INTEGER,
             vector BLOB
         );
         """
@@ -124,6 +114,11 @@ def _init_schema(conn: sqlite3.Connection) -> None:
         pass
 
     conn.commit()
+
+
+# -----------------------------------------------------------------------------
+# Basic CRUD
+# -----------------------------------------------------------------------------
 
 
 def store_capture(
@@ -178,7 +173,6 @@ def store_handles(
     style: str | None = None,
 ) -> None:
     """Store retrieval handles (query-shaped strings)."""
-    # Wipe existing rows + their FTS entries.
     old_ids = [r[0] for r in conn.execute("SELECT id FROM handles WHERE hash = ?", (hash,))]
     if old_ids:
         conn.execute(
@@ -192,7 +186,6 @@ def store_handles(
             (hash, i, htxt, style),
         )
         handle_id = cur.lastrowid
-        # External content table: keep handles_fts in sync manually.
         conn.execute("INSERT INTO handles_fts(rowid, text) VALUES (?, ?)", (handle_id, htxt))
     conn.commit()
 
@@ -203,9 +196,6 @@ def store_chunks(
     chunks: list[str],
 ) -> None:
     """Store chunks and populate FTS."""
-    # Also wipe FTS rows for this hash.
-    # Since chunks_fts is an external content table, deleting from chunks does
-    # NOT delete from chunks_fts automatically.
     old_ids = [r[0] for r in conn.execute("SELECT id FROM chunks WHERE hash = ?", (hash,))]
     if old_ids:
         conn.execute(
@@ -227,10 +217,8 @@ def store_chunks(
 
 def _serialize_vec_f32(vec: list[float]) -> bytes:
     """Serialize a Python list[float] into sqlite-vec's float32 blob format."""
-    import sqlite_vec  # type: ignore
+    import sqlite_vec
 
-    # sqlite-vec docs: serialize_float32 packs float32-compatible BLOBs.
-    # https://alexgarcia.xyz/sqlite-vec/python.html
     return sqlite_vec.serialize_float32(vec)
 
 
@@ -250,9 +238,210 @@ def store_embedding(
     conn.commit()
 
 
-def delete_embeddings(conn: sqlite3.Connection, hash: str, kind: str) -> None:
-    conn.execute("DELETE FROM embeddings WHERE hash = ? AND kind = ?", (hash, kind))
+def delete_embeddings(conn: sqlite3.Connection, hash: str, kind: str | None = None) -> None:
+    """Delete embeddings for a hash. If kind is None, delete all kinds."""
+    if kind:
+        conn.execute("DELETE FROM embeddings WHERE hash = ? AND kind = ?", (hash, kind))
+    else:
+        conn.execute("DELETE FROM embeddings WHERE hash = ?", (hash,))
     conn.commit()
+
+
+# -----------------------------------------------------------------------------
+# List / Get / Delete
+# -----------------------------------------------------------------------------
+
+
+@dataclass
+class CaptureInfo:
+    """Summary info for a capture."""
+
+    hash: str
+    source_uri: str
+    captured_at: str
+    title: str | None
+    author: str | None
+    date: str | None
+    summary: str | None
+    chunk_count: int
+    handle_count: int
+
+
+def list_captures(conn: sqlite3.Connection) -> list[CaptureInfo]:
+    """List all captures with metadata, ordered by capture date descending."""
+    rows = conn.execute(
+        """
+        SELECT 
+            c.hash,
+            c.source_uri,
+            c.captured_at,
+            m.title,
+            m.author,
+            m.date,
+            m.summary,
+            (SELECT COUNT(*) FROM chunks WHERE chunks.hash = c.hash) as chunk_count,
+            (SELECT COUNT(*) FROM handles WHERE handles.hash = c.hash) as handle_count
+        FROM captures c
+        LEFT JOIN metadata m ON c.hash = m.hash
+        ORDER BY c.captured_at DESC
+        """
+    ).fetchall()
+
+    return [
+        CaptureInfo(
+            hash=r["hash"],
+            source_uri=r["source_uri"],
+            captured_at=r["captured_at"],
+            title=r["title"],
+            author=r["author"],
+            date=r["date"],
+            summary=r["summary"],
+            chunk_count=r["chunk_count"],
+            handle_count=r["handle_count"],
+        )
+        for r in rows
+    ]
+
+
+@dataclass
+class CaptureDetail:
+    """Full detail for a single capture."""
+
+    hash: str
+    source_uri: str
+    captured_at: str
+    raw_path: str | None
+    title: str | None
+    author: str | None
+    date: str | None
+    summary: str | None
+    handles: list[str]
+    chunks: list[str]
+
+
+def get_capture(conn: sqlite3.Connection, hash_prefix: str) -> CaptureDetail | None:
+    """Get a capture by hash or hash prefix. Returns None if not found or ambiguous."""
+    # Try exact match first
+    row = conn.execute(
+        """
+        SELECT c.hash, c.source_uri, c.captured_at, c.raw_path,
+               m.title, m.author, m.date, m.summary
+        FROM captures c
+        LEFT JOIN metadata m ON c.hash = m.hash
+        WHERE c.hash = ?
+        """,
+        (hash_prefix,),
+    ).fetchone()
+
+    # If no exact match, try prefix
+    if not row:
+        rows = conn.execute(
+            """
+            SELECT c.hash, c.source_uri, c.captured_at, c.raw_path,
+                   m.title, m.author, m.date, m.summary
+            FROM captures c
+            LEFT JOIN metadata m ON c.hash = m.hash
+            WHERE c.hash LIKE ?
+            """,
+            (hash_prefix + "%",),
+        ).fetchall()
+
+        if len(rows) == 0:
+            return None
+        if len(rows) > 1:
+            # Ambiguous prefix
+            return None
+        row = rows[0]
+
+    h = row["hash"]
+
+    handles = [
+        r["text"]
+        for r in conn.execute(
+            "SELECT text FROM handles WHERE hash = ? ORDER BY handle_index", (h,)
+        ).fetchall()
+    ]
+
+    chunks = [
+        r["text"]
+        for r in conn.execute(
+            "SELECT text FROM chunks WHERE hash = ? ORDER BY chunk_index", (h,)
+        ).fetchall()
+    ]
+
+    return CaptureDetail(
+        hash=h,
+        source_uri=row["source_uri"],
+        captured_at=row["captured_at"],
+        raw_path=row["raw_path"],
+        title=row["title"],
+        author=row["author"],
+        date=row["date"],
+        summary=row["summary"],
+        handles=handles,
+        chunks=chunks,
+    )
+
+
+def get_last_capture(conn: sqlite3.Connection) -> CaptureDetail | None:
+    """Get the most recently captured item."""
+    row = conn.execute(
+        "SELECT hash FROM captures ORDER BY captured_at DESC LIMIT 1"
+    ).fetchone()
+    if not row:
+        return None
+    return get_capture(conn, row["hash"])
+
+
+def delete_capture(conn: sqlite3.Connection, hash_prefix: str, storage_dir: Path | None = None) -> str | None:
+    """Delete a capture by hash/prefix. Returns the deleted hash, or None if not found."""
+    # Resolve prefix to full hash
+    detail = get_capture(conn, hash_prefix)
+    if not detail:
+        return None
+
+    h = detail.hash
+
+    # Delete FTS entries first (external content tables)
+    chunk_ids = [r[0] for r in conn.execute("SELECT id FROM chunks WHERE hash = ?", (h,))]
+    if chunk_ids:
+        conn.execute(
+            f"DELETE FROM chunks_fts WHERE rowid IN ({','.join(['?'] * len(chunk_ids))})",
+            chunk_ids,
+        )
+
+    handle_ids = [r[0] for r in conn.execute("SELECT id FROM handles WHERE hash = ?", (h,))]
+    if handle_ids:
+        conn.execute(
+            f"DELETE FROM handles_fts WHERE rowid IN ({','.join(['?'] * len(handle_ids))})",
+            handle_ids,
+        )
+
+    # Delete from tables
+    conn.execute("DELETE FROM embeddings WHERE hash = ?", (h,))
+    conn.execute("DELETE FROM chunks WHERE hash = ?", (h,))
+    conn.execute("DELETE FROM handles WHERE hash = ?", (h,))
+    conn.execute("DELETE FROM metadata WHERE hash = ?", (h,))
+    conn.execute("DELETE FROM captures WHERE hash = ?", (h,))
+    conn.commit()
+
+    # Delete raw file
+    if detail.raw_path:
+        raw = Path(detail.raw_path)
+        if raw.exists():
+            raw.unlink()
+            # Try to remove parent dir if empty
+            try:
+                raw.parent.rmdir()
+            except OSError:
+                pass
+
+    return h
+
+
+# -----------------------------------------------------------------------------
+# Search
+# -----------------------------------------------------------------------------
 
 
 def search_fts_chunks(conn: sqlite3.Connection, query: str, k: int = 50) -> list[dict[str, Any]]:
@@ -271,7 +460,6 @@ def search_fts_chunks(conn: sqlite3.Connection, query: str, k: int = 50) -> list
     try:
         rows = conn.execute(sql, (query, k)).fetchall()
     except sqlite3.OperationalError:
-        # FTS5 query syntax is picky; fall back to a quoted phrase.
         rows = conn.execute(sql, (f'"{query}"', k)).fetchall()
     return [dict(r) for r in rows]
 
@@ -304,11 +492,7 @@ def knn_embeddings(
     k: int = 50,
     distance: str = "cosine",
 ) -> list[dict[str, Any]]:
-    """Brute-force KNN over embeddings using sqlite-vec scalar distance functions.
-
-    sqlite-vec supports vec_distance_L2 / vec_distance_L1 / vec_distance_cosine.
-    https://alexgarcia.xyz/sqlite-vec/features/knn.html
-    """
+    """Brute-force KNN over embeddings."""
     q = _serialize_vec_f32(query_vec)
     if distance == "cosine":
         dist_fn = "vec_distance_cosine"
@@ -339,7 +523,7 @@ def knn_embeddings(
 @dataclass(frozen=True)
 class HitKey:
     hash: str
-    kind: str  # 'chunk' or 'handle'
+    kind: str
     index: int
 
 
@@ -351,8 +535,11 @@ def rrf_fuse(
     """Reciprocal Rank Fusion over several ranked lists.
 
     Score = sum(1 / (k + rank)).
-    Reference: Cormack et al., SIGIR 2009.
-    https://cormack.uwaterloo.ca/cormacksigir09-rrf.pdf
+
+    With k=60 and 4 channels:
+    - #1 in all channels: ~0.066
+    - #1 in one channel only: ~0.016
+    - Scores >0.05 are strong, 0.02-0.05 moderate, <0.02 weak
     """
     scores: dict[HitKey, float] = {}
     for _, hits in ranked_lists.items():
@@ -375,17 +562,12 @@ def search_hybrid(
     """
     ranked: dict[str, list[HitKey]] = {}
 
-    # Lexical (chunks)
     fts_chunks = search_fts_chunks(conn, query, k=k_each)
     ranked["fts_chunks"] = [HitKey(r["hash"], "chunk", int(r["chunk_index"])) for r in fts_chunks]
 
-    # Lexical (handles)
     fts_handles = search_fts_handles(conn, query, k=k_each)
     ranked["fts_handles"] = [HitKey(r["hash"], "handle", int(r["handle_index"])) for r in fts_handles]
 
-    # Vector channels (optional if query_vec provided)
-    vec_handles: list[dict[str, Any]] = []
-    vec_chunks: list[dict[str, Any]] = []
     if query_vec is not None:
         vec_handles = knn_embeddings(conn, query_vec, kind="handle", k=k_each, distance="cosine")
         ranked["vec_handles"] = [HitKey(r["hash"], "handle", int(r["chunk_index"])) for r in vec_handles]
@@ -395,9 +577,7 @@ def search_hybrid(
 
     fused = rrf_fuse(ranked, k=rrf_k)
 
-    # Gather details for top fused hits.
-    # We fetch payloads in two batches: chunks and handles.
-    top_keys = sorted(fused.items(), key=lambda kv: kv[1], reverse=True)[: k_each]
+    top_keys = sorted(fused.items(), key=lambda kv: kv[1], reverse=True)[:k_each]
 
     chunk_ids = [(hk.hash, hk.index) for hk, _ in top_keys if hk.kind == "chunk"]
     handle_ids = [(hk.hash, hk.index) for hk, _ in top_keys if hk.kind == "handle"]
@@ -440,7 +620,6 @@ def search_hybrid(
 
     out: list[dict[str, Any]] = []
     for hk, score in top_keys:
-        payload: dict[str, Any] | None
         if hk.kind == "chunk":
             payload = chunk_map.get((hk.hash, hk.index))
         else:

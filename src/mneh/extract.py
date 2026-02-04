@@ -98,8 +98,6 @@ def extract_metadata(
     content: str,
     url: str | None = None,
     hints: dict | None = None,
-    *,
-    system_prompt: str | None = None,
     model: str = "gpt-5.2",
 ) -> dict:
     """Extract title, author, date, summary, handles."""
@@ -118,7 +116,7 @@ def extract_metadata(
     response = client.chat.completions.create(
         model=model,
         messages=[
-            {"role": "system", "content": system_prompt or SYSTEM_PROMPT},
+            {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": user_content},
         ],
         response_format={"type": "json_object"},

@@ -1,232 +1,263 @@
-"""Command-line interface."""
+"""Command-line interface.
+
+Commands:
+    mneh capture <url>              Ingest a URL
+    mneh search <query>             Search the corpus
+    mneh show <hash>                Inspect a capture
+    mneh list                       List all captures
+    mneh delete <hash>              Remove a capture
+
+Flags:
+    -v          verbose (more detail)
+    -vv         very verbose (even more detail)
+    -u          show URLs (for list)
+    -q QUERY    resolve query to top result (for show)
+    --json      machine-readable output
+    --db PATH   use alternate database (default: ~/.mneh/mneh.db)
+"""
+
+from __future__ import annotations
 
 import argparse
-import json
-import hashlib
-import textwrap
-from datetime import datetime, timezone
+import sys
 from pathlib import Path
-from typing import Any
 
-from .capture import capture_url, fetch_text
-from .extract import extract_metadata
+from .capture import capture_url
 from .embed import embed_single
-from .storage import connect, search_hybrid
-from .display import collapse_hits_by_document, filter_by_score, format_result
+from .storage import (
+    connect,
+    search_hybrid,
+    list_captures,
+    get_capture,
+    get_last_capture,
+    delete_capture,
+    HitKey,
+)
+from .display import (
+    format_list,
+    format_show,
+    format_show_json,
+    format_search,
+    format_search_json,
+    aggregate_search_results,
+    filter_noise,
+)
 
 DEFAULT_DB = Path.home() / ".mneh" / "mneh.db"
 DEFAULT_STORAGE = Path.home() / ".mneh" / "storage"
 
 
 def main():
-    parser = argparse.ArgumentParser(prog="mneh")
+    parser = argparse.ArgumentParser(
+        prog="mneh",
+        description="Local-first capture + retrieval for your exocortex.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+    mneh capture "https://example.com/article"
+    mneh search "coordination failure game theory"
+    mneh search "react hooks" -v
+    mneh list
+    mneh list -uv
+    mneh show a1b2c3d4
+    mneh show --last
+    mneh show -q "moloch"
+    mneh delete a1b2c3d4
+
+RRF Score Guide (with k=60, 4 channels):
+    >0.05   strong hit (top ranks in multiple channels)
+    0.02-0.05   moderate (mid-ranks or single-channel)
+    <0.02   weak (probably noise, filtered by default)
+        """,
+    )
+
+    # Global options
+    parser.add_argument(
+        "--db",
+        type=Path,
+        default=DEFAULT_DB,
+        help="database path (default: ~/.mneh/mneh.db)",
+    )
+
     sub = parser.add_subparsers(dest="command", required=True)
 
     # capture
     cap = sub.add_parser("capture", help="Capture a URL")
-    cap.add_argument("url")
-    cap.add_argument("--db", type=Path, default=DEFAULT_DB)
-    cap.add_argument("--storage", type=Path, default=DEFAULT_STORAGE)
-    cap.add_argument("--prompt-file", type=Path, help="override SYSTEM_PROMPT from a file")
-
-    # probe (prompt iteration, no DB writes)
-    p = sub.add_parser("probe", help="Fetch + extract handles for manual inspection")
-    p.add_argument("urls", nargs="+", help="3-5 varied URLs is a good start")
-    p.add_argument("--prompt-file", type=Path, help="override SYSTEM_PROMPT from a file")
-    p.add_argument("--out", type=Path, help="write results to a JSON file")
-
-    pc = sub.add_parser("probe-compare", help="Compare two probe JSON outputs")
-    pc.add_argument("a", type=Path, help="first probe JSON")
-    pc.add_argument("b", type=Path, help="second probe JSON")
+    cap.add_argument("url", help="URL to capture")
+    cap.add_argument(
+        "--storage",
+        type=Path,
+        default=DEFAULT_STORAGE,
+        help="raw file storage directory",
+    )
 
     # search
     s = sub.add_parser("search", help="Search captures")
-    s.add_argument("query")
-    s.add_argument("--db", type=Path, default=DEFAULT_DB)
-    s.add_argument("--k", type=int, default=20, help="# results to show")
-    s.add_argument("--k-each", type=int, default=50, help="candidates per channel")
-    s.add_argument("--rrf-k", type=int, default=60, help="RRF constant")
-    s.add_argument("--no-vector", action="store_true", help="skip embedding-based search")
-    s.add_argument("--debug", action="store_true", help="print channel diagnostics")
-    s.add_argument("--min-rrf", type=float, default=None, help="absolute score floor (after fusion)")
-    s.add_argument(
-        "--drop-bottom",
-        type=float,
-        default=0.10,
-        help="drop bottom fraction of doc-level scores (default: 0.10)",
+    s.add_argument("query", help="search query")
+    s.add_argument("-v", "--verbose", action="count", default=0, help="verbose output (-v for handles/chunks)")
+    s.add_argument("-k", type=int, default=20, help="number of results (default: 20)")
+    s.add_argument("--json", action="store_true", help="JSON output")
+    s.add_argument("--no-vector", action="store_true", help="skip embedding search (FTS only)")
+
+    # show
+    sh = sub.add_parser("show", help="Show a capture")
+    sh.add_argument("hash", nargs="?", help="hash or hash prefix")
+    sh.add_argument("--last", action="store_true", help="show most recent capture")
+    sh.add_argument("-q", "--query", help="show top result for query")
+    sh.add_argument("-v", "--verbose", action="count", default=0, help="verbose (-v handles, -vv chunks)")
+    sh.add_argument("--json", action="store_true", help="JSON output")
+
+    # list
+    ls = sub.add_parser("list", help="List captures")
+    ls.add_argument("-v", "--verbose", action="store_true", help="show chunk/handle counts")
+    ls.add_argument("-u", "--urls", action="store_true", help="show URLs")
+    ls.add_argument("--json", action="store_true", help="JSON output")
+
+    # delete
+    d = sub.add_parser("delete", help="Delete a capture")
+    d.add_argument("hash", help="hash or hash prefix")
+    d.add_argument(
+        "--storage",
+        type=Path,
+        default=DEFAULT_STORAGE,
+        help="raw file storage directory",
     )
-    s.add_argument("--no-dedup", action="store_true", help="do not collapse multiple hits per doc")
-    s.add_argument("--snippet-chars", type=int, default=360, help="snippet window size")
-    s.add_argument("--width", type=int, default=92, help="wrap width")
 
     args = parser.parse_args()
 
-    # Ensure dirs exist for commands that actually use the DB
-    db_path = getattr(args, "db", None)
-    if db_path is not None:
-        db_path.parent.mkdir(parents=True, exist_ok=True)
+    # Ensure dirs exist
+    args.db.parent.mkdir(parents=True, exist_ok=True)
 
     if args.command == "capture":
-        args.storage.mkdir(parents=True, exist_ok=True)
-        system_prompt = args.prompt_file.read_text(encoding="utf-8") if args.prompt_file else None
-        h = capture_url(args.db, args.url, args.storage, system_prompt=system_prompt)
-        print(f"Captured: {h}")
-
-    elif args.command == "probe":
-        system_prompt = None
-        if args.prompt_file:
-            system_prompt = args.prompt_file.read_text(encoding="utf-8")
-
-        run: dict[str, Any] = {
-            "created_at": datetime.now(timezone.utc).isoformat(),
-            "prompt_file": str(args.prompt_file) if args.prompt_file else None,
-            "documents": [],
-        }
-
-        for i, url in enumerate(args.urls, start=1):
-            text, traf_meta = fetch_text(url)
-            content_hash = hashlib.sha256(text.encode()).hexdigest()
-
-            meta = extract_metadata(
-                text,
-                url=url,
-                hints={
-                    "title": traf_meta.get("title"),
-                    "author": traf_meta.get("author"),
-                    "date": traf_meta.get("date"),
-                },
-                system_prompt=system_prompt,
-            )
-
-            handles = meta.get("handles") or []
-            # Basic duplicate check (exact, case-insensitive)
-            norm = [h.strip().lower() for h in handles if h and h.strip()]
-            dup_count = len(norm) - len(set(norm))
-
-            title = meta.get("title") or "Untitled"
-            summary = meta.get("summary") or ""
-
-            print("=" * 92)
-            print(f"[{i}/{len(args.urls)}] {title}  [{content_hash[:8]}]")
-            print(f"  {url}")
-            if summary:
-                print(f"  {summary}")
-            print(f"  handles: {len(handles)}" + (f"  (dupes: {dup_count})" if dup_count else ""))
-            for j, htxt in enumerate(handles, start=1):
-                prefix = f"    {j:02d}) "
-                wrapped = textwrap.fill(
-                    htxt,
-                    width=92,
-                    initial_indent=prefix,
-                    subsequent_indent=" " * len(prefix),
-                )
-                print(wrapped)
-
-            run["documents"].append(
-                {
-                    "url": url,
-                    "content_hash": content_hash,
-                    "title": meta.get("title"),
-                    "author": meta.get("author"),
-                    "date": meta.get("date"),
-                    "summary": summary,
-                    "handles": handles,
-                }
-            )
-
-        if args.out:
-            args.out.parent.mkdir(parents=True, exist_ok=True)
-            args.out.write_text(json.dumps(run, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-            print("=" * 92)
-            print(f"Wrote: {args.out}")
-
-    elif args.command == "probe-compare":
-        a = json.loads(args.a.read_text(encoding="utf-8"))
-        b = json.loads(args.b.read_text(encoding="utf-8"))
-
-        def index(d: dict[str, Any]) -> dict[str, dict[str, Any]]:
-            out: dict[str, dict[str, Any]] = {}
-            for doc in d.get("documents", []):
-                out[str(doc.get("url"))] = doc
-            return out
-
-        ia = index(a)
-        ib = index(b)
-        urls = sorted(set(ia) | set(ib))
-
-        print("=" * 92)
-        print(f"Compare: {args.a}  vs  {args.b}")
-        for url in urls:
-            da = ia.get(url)
-            db = ib.get(url)
-            print("-" * 92)
-            print(url)
-            if da is None:
-                print("  only in B")
-                continue
-            if db is None:
-                print("  only in A")
-                continue
-
-            ha = set((h or "").strip() for h in da.get("handles", []) if h)
-            hb = set((h or "").strip() for h in db.get("handles", []) if h)
-            added = sorted(hb - ha)
-            removed = sorted(ha - hb)
-            inter = len(ha & hb)
-            union = max(1, len(ha | hb))
-            jacc = inter / union
-            print(f"  A: {len(ha)} handles   B: {len(hb)} handles   Jaccard: {jacc:.3f}")
-            if added:
-                print("  + added:")
-                for h in added:
-                    print(f"    + {h}")
-            if removed:
-                print("  - removed:")
-                for h in removed:
-                    print(f"    - {h}")
-
+        cmd_capture(args)
     elif args.command == "search":
-        conn = connect(args.db)
+        cmd_search(args)
+    elif args.command == "show":
+        cmd_show(args)
+    elif args.command == "list":
+        cmd_list(args)
+    elif args.command == "delete":
+        cmd_delete(args)
 
-        qvec = None
-        if not args.no_vector:
-            qvec = embed_single(args.query)
 
-        results, debug_lists = search_hybrid(
-            conn,
-            args.query,
-            qvec,
-            k_each=args.k_each,
-            rrf_k=args.rrf_k,
-        )
+def cmd_capture(args):
+    """Capture a URL."""
+    args.storage.mkdir(parents=True, exist_ok=True)
+    h = capture_url(args.db, args.url, args.storage)
+    print(f"Captured: {h[:8]}")
 
+
+def cmd_search(args):
+    """Search the corpus."""
+    conn = connect(args.db)
+
+    qvec = None
+    if not args.no_vector:
+        qvec = embed_single(args.query)
+
+    results, debug_lists = search_hybrid(conn, args.query, qvec)
+
+    if not results:
+        print("No results.")
+        return
+
+    # Build score map from debug_lists for aggregation
+    hit_scores: dict[HitKey, float] = {}
+    for r in results:
+        hk = HitKey(r["hash"], r["hit_kind"], r["hit_index"])
+        hit_scores[hk] = r["rrf_score"]
+
+    docs = aggregate_search_results(results, hit_scores)
+    docs = filter_noise(docs)
+
+    if not docs:
+        print("No results above noise threshold.")
+        return
+
+    if args.json:
+        print(format_search_json(docs[:args.k]))
+    else:
+        print(format_search(docs, args.query, verbose=args.verbose > 0, limit=args.k))
+
+
+def cmd_show(args):
+    """Show a capture."""
+    conn = connect(args.db)
+
+    # Resolve what to show
+    if args.last:
+        detail = get_last_capture(conn)
+        if not detail:
+            print("No captures.")
+            sys.exit(1)
+    elif args.query:
+        # Search and get top result
+        qvec = embed_single(args.query)
+        results, _ = search_hybrid(conn, args.query, qvec)
         if not results:
-            print("No results.")
-            return
+            print(f"No results for query: {args.query}")
+            sys.exit(1)
+        # Get the top-scoring document hash
+        top_hash = results[0]["hash"]
+        detail = get_capture(conn, top_hash)
+        if not detail:
+            print(f"Could not load capture: {top_hash}")
+            sys.exit(1)
+    elif args.hash:
+        detail = get_capture(conn, args.hash)
+        if not detail:
+            print(f"Not found or ambiguous: {args.hash}")
+            sys.exit(1)
+    else:
+        print("Specify a hash, --last, or -q QUERY")
+        sys.exit(1)
 
-        if args.no_dedup:
-            for r in results[: args.k]:
-                doc = collapse_hits_by_document([r])[0]
-                print(format_result(doc, query=args.query, snippet_chars=args.snippet_chars, width=args.width))
-                print()
-        else:
-            docs = collapse_hits_by_document(results)
-            docs, applied = filter_by_score(docs, drop_bottom_frac=args.drop_bottom, min_score=args.min_rrf)
+    if args.json:
+        print(format_show_json(detail))
+    else:
+        print(format_show(detail, verbose=args.verbose))
 
-            if not docs:
-                msg = "No results above threshold."
-                if applied is not None:
-                    msg += f" (threshold={applied:.6f})"
-                print(msg)
-                return
 
-            for doc in docs[: args.k]:
-                print(format_result(doc, query=args.query, snippet_chars=args.snippet_chars, width=args.width))
-                print()
+def cmd_list(args):
+    """List all captures."""
+    conn = connect(args.db)
+    captures = list_captures(conn)
 
-        if args.debug:
-            for name, hits in debug_lists.items():
-                print(f"[{name}] {len(hits)} hits")
+    if args.json:
+        import json
+        out = [
+            {
+                "hash": c.hash,
+                "title": c.title,
+                "source_uri": c.source_uri,
+                "captured_at": c.captured_at,
+                "date": c.date,
+                "chunk_count": c.chunk_count,
+                "handle_count": c.handle_count,
+            }
+            for c in captures
+        ]
+        print(json.dumps(out, indent=2, ensure_ascii=False))
+    else:
+        print(format_list(captures, show_urls=args.urls, verbose=args.verbose))
+
+
+def cmd_delete(args):
+    """Delete a capture."""
+    conn = connect(args.db)
+
+    # Show what we're about to delete
+    detail = get_capture(conn, args.hash)
+    if not detail:
+        print(f"Not found or ambiguous: {args.hash}")
+        sys.exit(1)
+
+    deleted = delete_capture(conn, args.hash, storage_dir=args.storage)
+    if deleted:
+        print(f"Deleted: {deleted[:8]} ({detail.title or 'Untitled'})")
+    else:
+        print(f"Failed to delete: {args.hash}")
+        sys.exit(1)
 
 
 if __name__ == "__main__":

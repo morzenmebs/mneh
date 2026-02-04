@@ -1,11 +1,15 @@
 """Capture URLs and extract content."""
 
+from __future__ import annotations
+
 import json
-import trafilatura
 from pathlib import Path
+
+import trafilatura
 
 from .storage import (
     connect,
+    delete_embeddings,
     store_capture,
     store_chunks,
     store_embedding,
@@ -38,21 +42,13 @@ def fetch_text(url: str) -> tuple[str, dict]:
     return text, traf_meta
 
 
-def capture_url(
-    db_path: Path,
-    url: str,
-    storage_dir: Path,
-    *,
-    system_prompt: str | None = None,
-    model: str = "gpt-5.2",
-) -> str:
+def capture_url(db_path: Path, url: str, storage_dir: Path) -> str:
     """Fetch URL, extract content, store with embeddings, return hash."""
     text, traf_meta = fetch_text(url)
-    
-    # Store raw
+
     conn = connect(db_path)
     h = store_capture(conn, text, url, content_type="text/plain", storage_dir=storage_dir)
-    
+
     # LLM extraction with hints
     meta = extract_metadata(
         text,
@@ -62,10 +58,8 @@ def capture_url(
             "author": traf_meta.get("author"),
             "date": traf_meta.get("date"),
         },
-        system_prompt=system_prompt,
-        model=model,
     )
-    
+
     store_metadata(
         conn,
         h,
@@ -75,20 +69,23 @@ def capture_url(
         topics=None,
         summary=meta.get("summary"),
     )
-    
+
     # Chunk
     chunks = chunk_text(text)
     store_chunks(conn, h, chunks)
 
     handles = meta.get("handles") or []
     store_handles(conn, h, handles, style="llm")
-    
+
+    # Clear any existing embeddings (for re-capture case)
+    delete_embeddings(conn, h)
+
     # Embed everything in one batch
     texts_to_embed = handles + chunks
-    
+
     if texts_to_embed:
         vectors = embed_texts(texts_to_embed)
-        
+
         # Store handle embeddings
         for i, vec in enumerate(vectors[: len(handles)]):
             store_embedding(conn, h, "handle", vec, chunk_index=i)
@@ -96,5 +93,5 @@ def capture_url(
         # Store chunk embeddings
         for i, vec in enumerate(vectors[len(handles) :]):
             store_embedding(conn, h, "chunk", vec, chunk_index=i)
-    
+
     return h

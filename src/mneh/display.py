@@ -1,37 +1,38 @@
-"""CLI-facing display helpers.
+"""Display formatting for CLI output.
 
-This module is intentionally ANSI-free: it formats readable, wrapped text for
-terminal output.
+Produces clean, columnar text output. No ANSI colors (keep it simple).
 """
 
 from __future__ import annotations
 
+import json
 import re
 import textwrap
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 from typing import Any, Iterable
 
+from .storage import CaptureInfo, CaptureDetail, HitKey
+
+
+# -----------------------------------------------------------------------------
+# Text utilities
+# -----------------------------------------------------------------------------
 
 _STOPWORDS = {
     "a", "an", "the", "and", "or", "but", "if", "then", "else", "when", "while",
     "to", "of", "in", "on", "for", "with", "without", "as", "at", "by", "from",
-    "is", "are", "was", "were", "be", "been", "being", "it", "this", "that", "these",
-    "those", "i", "you", "we", "they", "he", "she", "them", "his", "her", "our",
-    "your", "their", "my", "me",
+    "is", "are", "was", "were", "be", "been", "being", "it", "this", "that",
+    "these", "those", "i", "you", "we", "they", "he", "she", "them", "his",
+    "her", "our", "your", "their", "my", "me",
 }
 
 
 def extract_query_terms(query: str) -> list[str]:
-    r"""Cheap keywordization for highlighting.
-
-    Keeps \w+ tokens, lowercases, drops stopwords and very short tokens.
-    """
+    """Extract meaningful terms from a query for highlighting."""
     words = re.findall(r"\w+", query.lower())
     terms = [w for w in words if len(w) >= 3 and w not in _STOPWORDS]
-    # Prefer longer terms first to reduce partial overlap.
     terms.sort(key=len, reverse=True)
-    # Dedup while preserving order.
     seen: set[str] = set()
     out: list[str] = []
     for t in terms:
@@ -39,14 +40,6 @@ def extract_query_terms(query: str) -> list[str]:
             out.append(t)
             seen.add(t)
     return out
-
-
-def _first_match_span(text: str, terms: Iterable[str]) -> tuple[int, int] | None:
-    for t in terms:
-        m = re.search(rf"\b{re.escape(t)}\b", text, flags=re.IGNORECASE)
-        if m:
-            return m.start(), m.end()
-    return None
 
 
 def highlight_bracket(text: str, terms: Iterable[str]) -> str:
@@ -58,13 +51,20 @@ def highlight_bracket(text: str, terms: Iterable[str]) -> str:
     return out
 
 
-def excerpt_around_terms(text: str, terms: Iterable[str], *, max_chars: int) -> str:
-    """Take a window around the first query-term match (or leading text)."""
+def excerpt_around_terms(text: str, terms: Iterable[str], *, max_chars: int = 200) -> str:
+    """Extract a snippet around the first query-term match."""
     s = " ".join((text or "").split())
     if not s:
         return ""
 
-    span = _first_match_span(s, terms)
+    # Find first match
+    span = None
+    for t in terms:
+        m = re.search(rf"\b{re.escape(t)}\b", s, flags=re.IGNORECASE)
+        if m:
+            span = (m.start(), m.end())
+            break
+
     if span is None or len(s) <= max_chars:
         return s[:max_chars].strip()
 
@@ -73,7 +73,7 @@ def excerpt_around_terms(text: str, terms: Iterable[str], *, max_chars: int) -> 
     lo = max(0, start - half)
     hi = min(len(s), end + half)
 
-    # Nudge to word boundaries.
+    # Nudge to word boundaries
     if lo > 0:
         lo = s.rfind(" ", 0, lo) + 1 or 0
     if hi < len(s):
@@ -86,63 +86,175 @@ def excerpt_around_terms(text: str, terms: Iterable[str], *, max_chars: int) -> 
     return (prefix + s[lo:hi].strip() + suffix).strip()
 
 
-@dataclass(frozen=True)
-class DisplayResult:
+def truncate(s: str, max_len: int) -> str:
+    """Truncate string with ellipsis if needed."""
+    if len(s) <= max_len:
+        return s
+    return s[: max_len - 1] + "…"
+
+
+# -----------------------------------------------------------------------------
+# List formatting
+# -----------------------------------------------------------------------------
+
+
+def format_list(
+    captures: list[CaptureInfo],
+    *,
+    show_urls: bool = False,
+    verbose: bool = False,
+) -> str:
+    """Format capture list for terminal output.
+
+    Default:     hash  date  title
+    -u:          hash  date  title + url on second line
+    -v:          hash  date  chunks  handles  title
+    -uv:         hash  date  chunks  handles  title + url on second line
+    """
+    if not captures:
+        return "No captures."
+
+    lines = []
+    for c in captures:
+        h = c.hash[:8]
+        date = (c.captured_at or "")[:10]  # YYYY-MM-DD
+        title = c.title or "Untitled"
+
+        if verbose:
+            # hash  date  ch  hd  title
+            line = f"{h}  {date}  {c.chunk_count:3d} ch  {c.handle_count:3d} hd  {title}"
+        else:
+            # hash  date  title
+            line = f"{h}  {date}  {title}"
+
+        lines.append(line)
+
+        if show_urls:
+            # URL on second line, aligned with date column
+            indent = " " * 10  # 8 (hash) + 2 (spaces)
+            lines.append(f"{indent}{c.source_uri}")
+
+    return "\n".join(lines)
+
+
+# -----------------------------------------------------------------------------
+# Show formatting
+# -----------------------------------------------------------------------------
+
+
+def format_show(
+    detail: CaptureDetail,
+    *,
+    verbose: int = 0,  # 0=normal, 1=show handles, 2=show handles+chunks
+) -> str:
+    """Format a single capture for display.
+
+    verbose=0: metadata only
+    verbose=1: metadata + handles list
+    verbose=2: metadata + handles + chunk previews
+    """
+    lines = []
+
+    lines.append(f"hash:     {detail.hash}")
+    lines.append(f"title:    {detail.title or '(none)'}")
+    if detail.author:
+        lines.append(f"author:   {detail.author}")
+    if detail.date:
+        lines.append(f"date:     {detail.date}")
+    lines.append(f"url:      {detail.source_uri}")
+    lines.append(f"captured: {detail.captured_at}")
+    if detail.summary:
+        wrapped = textwrap.fill(detail.summary, width=70, initial_indent="summary:  ", subsequent_indent="          ")
+        lines.append(wrapped)
+
+    lines.append("")
+    lines.append(f"chunks:   {len(detail.chunks)}")
+    lines.append(f"handles:  {len(detail.handles)}")
+
+    if verbose >= 1 and detail.handles:
+        lines.append("")
+        lines.append(f"handles ({len(detail.handles)}):")
+        for i, h in enumerate(detail.handles, start=1):
+            lines.append(f"  {i:02d}  {h}")
+
+    if verbose >= 2 and detail.chunks:
+        lines.append("")
+        lines.append(f"chunks ({len(detail.chunks)}):")
+        for i, chunk in enumerate(detail.chunks):
+            preview = " ".join(chunk.split())[:100]
+            lines.append(f"  [{i}] {preview}...")
+
+    return "\n".join(lines)
+
+
+def format_show_json(detail: CaptureDetail) -> str:
+    """Format capture as JSON."""
+    return json.dumps(asdict(detail), indent=2, ensure_ascii=False)
+
+
+# -----------------------------------------------------------------------------
+# Search result formatting
+# -----------------------------------------------------------------------------
+
+
+@dataclass
+class DocResult:
+    """A document-level search result with aggregated hits."""
+
     hash: str
     title: str
     source_uri: str
     summary: str
     score: float
-    best_hit_kind: str
-    best_hit_index: int
-    snippet_kind: str
-    snippet_index: int
-    snippet_text: str
-    more_chunks: int
-    more_handles: int
+    handle_hits: list[tuple[float, int, str]]  # (score, index, text)
+    chunk_hits: list[tuple[float, int, str]]   # (score, index, text)
 
 
-def collapse_hits_by_document(results: list[dict[str, Any]]) -> list[DisplayResult]:
-    """Collapse multiple hit rows into one per document.
+def aggregate_search_results(
+    results: list[dict[str, Any]],
+    hit_scores: dict[HitKey, float],
+) -> list[DocResult]:
+    """Aggregate raw search hits into per-document results."""
+    by_hash: dict[str, dict[str, Any]] = {}
+    handle_hits: dict[str, list[tuple[float, int, str]]] = defaultdict(list)
+    chunk_hits: dict[str, list[tuple[float, int, str]]] = defaultdict(list)
 
-    Selection rules:
-      - score = best rrf_score across hits
-      - snippet prefers the best *chunk* hit if available, else the best overall hit
-      - counts of suppressed hits are tracked for display
-    """
-    by_hash: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for r in results:
-        if r.get("hash"):
-            by_hash[str(r["hash"])].append(r)
+        h = r.get("hash")
+        if not h:
+            continue
 
-    docs: list[DisplayResult] = []
-    for h, hits in by_hash.items():
-        hits_sorted = sorted(hits, key=lambda x: float(x.get("rrf_score") or 0.0), reverse=True)
-        best = hits_sorted[0]
+        if h not in by_hash:
+            by_hash[h] = r
 
-        best_chunk = next((x for x in hits_sorted if x.get("hit_kind") == "chunk"), None)
-        snippet = best_chunk or best
+        kind = r.get("hit_kind")
+        idx = r.get("hit_index", 0)
+        text = r.get("text", "")
+        score = r.get("rrf_score", 0.0)
 
-        chunk_hits = [x for x in hits_sorted if x.get("hit_kind") == "chunk"]
-        handle_hits = [x for x in hits_sorted if x.get("hit_kind") == "handle"]
+        if kind == "handle":
+            handle_hits[h].append((score, idx, text))
+        elif kind == "chunk":
+            chunk_hits[h].append((score, idx, text))
 
-        more_chunks = max(0, len(chunk_hits) - (1 if snippet.get("hit_kind") == "chunk" else 0))
-        more_handles = max(0, len(handle_hits) - (1 if snippet.get("hit_kind") == "handle" else 0))
+    docs = []
+    for h, r in by_hash.items():
+        hh = sorted(handle_hits.get(h, []), key=lambda x: x[0], reverse=True)
+        ch = sorted(chunk_hits.get(h, []), key=lambda x: x[0], reverse=True)
+
+        # Doc score = max of all hits
+        all_scores = [s for s, _, _ in hh] + [s for s, _, _ in ch]
+        doc_score = max(all_scores) if all_scores else 0.0
 
         docs.append(
-            DisplayResult(
+            DocResult(
                 hash=h,
-                title=(best.get("title") or "Untitled"),
-                source_uri=(best.get("source_uri") or ""),
-                summary=(best.get("summary") or ""),
-                score=float(best.get("rrf_score") or 0.0),
-                best_hit_kind=str(best.get("hit_kind")),
-                best_hit_index=int(best.get("hit_index") or 0),
-                snippet_kind=str(snippet.get("hit_kind")),
-                snippet_index=int(snippet.get("hit_index") or 0),
-                snippet_text=str(snippet.get("text") or ""),
-                more_chunks=more_chunks,
-                more_handles=more_handles,
+                title=r.get("title") or "Untitled",
+                source_uri=r.get("source_uri") or "",
+                summary=r.get("summary") or "",
+                score=doc_score,
+                handle_hits=hh,
+                chunk_hits=ch,
             )
         )
 
@@ -150,69 +262,83 @@ def collapse_hits_by_document(results: list[dict[str, Any]]) -> list[DisplayResu
     return docs
 
 
-def filter_by_score(
-    docs: list[DisplayResult],
+def filter_noise(docs: list[DocResult], min_score: float = 0.015) -> list[DocResult]:
+    """Filter out results below noise threshold."""
+    return [d for d in docs if d.score >= min_score]
+
+
+def format_search(
+    docs: list[DocResult],
+    query: str,
     *,
-    drop_bottom_frac: float = 0.10,
-    min_score: float | None = None,
-) -> tuple[list[DisplayResult], float | None]:
-    """Filter docs by a score floor.
+    verbose: bool = False,
+    limit: int = 20,
+) -> str:
+    """Format search results.
 
-    If drop_bottom_frac is set and we have >=10 docs, we drop the bottom fraction
-    by score (doc-level).
-
-    Returns (filtered_docs, applied_threshold).
+    Default: rank, title, url, summary, best chunk snippet
+    Verbose: adds handle hits and chunk hits with scores
     """
     if not docs:
-        return [], None
+        return "No results."
 
-    threshold: float | None = None
-
-    if drop_bottom_frac and len(docs) >= 10:
-        frac = min(max(drop_bottom_frac, 0.0), 0.99)
-        scores = sorted(d.score for d in docs)
-        cut = int(len(scores) * frac)
-        cut = min(max(cut, 0), len(scores) - 1)
-        threshold = scores[cut]
-
-    if min_score is not None:
-        threshold = max(threshold or min_score, min_score)
-
-    if threshold is None:
-        return docs, None
-
-    return [d for d in docs if d.score >= threshold], threshold
-
-
-def format_result(
-    doc: DisplayResult,
-    *,
-    query: str,
-    snippet_chars: int = 360,
-    width: int = 92,
-) -> str:
     terms = extract_query_terms(query)
-    snippet = excerpt_around_terms(doc.snippet_text, terms, max_chars=snippet_chars)
-    snippet = highlight_bracket(snippet, terms)
+    lines = []
 
-    more = []
-    if doc.more_chunks:
-        more.append(f"+{doc.more_chunks} more chunks")
-    if doc.more_handles:
-        more.append(f"+{doc.more_handles} more handles")
-    more_s = f"  ({', '.join(more)})" if more else ""
+    for i, doc in enumerate(docs[:limit], start=1):
+        if verbose:
+            # Verbose format with score in header
+            lines.append(f"[{i}] {doc.title:<50} score: {doc.score:.4f}")
+        else:
+            lines.append(f"[{i}] {doc.title}")
 
-    header = (
-        f"{doc.title} [{doc.hash[:8]}]  score={doc.score:.6f}"
-        f"  (best={doc.best_hit_kind}:{doc.best_hit_index}, snippet={doc.snippet_kind}:{doc.snippet_index})"
-        f"{more_s}"
-    )
+        lines.append(f"    {doc.source_uri}")
 
-    lines = [header]
-    if doc.summary:
-        lines.append("  " + textwrap.fill(" ".join(doc.summary.split()), width=width, subsequent_indent="  "))
-    if doc.source_uri:
-        lines.append(f"  {doc.source_uri}")
-    if snippet:
-        lines.append("  " + textwrap.fill(snippet, width=width, subsequent_indent="  "))
+        if doc.summary:
+            wrapped = textwrap.fill(doc.summary, width=76, initial_indent="    ", subsequent_indent="    ")
+            lines.append(wrapped)
+
+        if verbose:
+            # Show handle hits
+            if doc.handle_hits:
+                lines.append("")
+                lines.append(f"    handles ({len(doc.handle_hits)} hits):")
+                for score, idx, text in doc.handle_hits[:5]:
+                    lines.append(f"      {score:.4f}  {text}")
+
+            # Show chunk hits
+            if doc.chunk_hits:
+                lines.append("")
+                lines.append(f"    chunks ({len(doc.chunk_hits)} hits):")
+                for score, idx, text in doc.chunk_hits[:3]:
+                    snippet = excerpt_around_terms(text, terms, max_chars=120)
+                    snippet = highlight_bracket(snippet, terms)
+                    lines.append(f"      {score:.4f}  [{idx}] \"{snippet}\"")
+        else:
+            # Just show best chunk snippet
+            if doc.chunk_hits:
+                _, idx, text = doc.chunk_hits[0]
+                snippet = excerpt_around_terms(text, terms, max_chars=200)
+                snippet = highlight_bracket(snippet, terms)
+                wrapped = textwrap.fill(f'"{snippet}"', width=76, initial_indent="    ", subsequent_indent="    ")
+                lines.append(wrapped)
+
+        lines.append("")
+
     return "\n".join(lines)
+
+
+def format_search_json(docs: list[DocResult]) -> str:
+    """Format search results as JSON."""
+    out = []
+    for d in docs:
+        out.append({
+            "hash": d.hash,
+            "title": d.title,
+            "source_uri": d.source_uri,
+            "summary": d.summary,
+            "score": d.score,
+            "handle_hits": [{"score": s, "index": i, "text": t} for s, i, t in d.handle_hits],
+            "chunk_hits": [{"score": s, "index": i, "text": t} for s, i, t in d.chunk_hits],
+        })
+    return json.dumps(out, indent=2, ensure_ascii=False)
