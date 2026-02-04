@@ -17,36 +17,54 @@ from .embed import embed_texts
 from .chunk import chunk_text
 
 
-def capture_url(db_path: Path, url: str, storage_dir: Path) -> str:
-    """Fetch URL, extract content, store with embeddings, return hash."""
-    # Fetch and extract
+def fetch_text(url: str) -> tuple[str, dict]:
+    """Fetch a URL and return (extracted_text, trafilatura_metadata_hints)."""
     downloaded = trafilatura.fetch_url(url)
     if not downloaded:
         raise ValueError(f"Failed to fetch {url}")
-    
+
     text = trafilatura.extract(downloaded)
     if not text:
         raise ValueError(f"Failed to extract content from {url}")
-    
-    # Get trafilatura's metadata as hints
-    traf_meta = {}
+
+    traf_meta: dict = {}
     try:
-        traf_json = trafilatura.extract(downloaded, output_format='json', with_metadata=True)
+        traf_json = trafilatura.extract(downloaded, output_format="json", with_metadata=True)
         if traf_json:
             traf_meta = json.loads(traf_json)
-    except:
+    except Exception:
         pass
+
+    return text, traf_meta
+
+
+def capture_url(
+    db_path: Path,
+    url: str,
+    storage_dir: Path,
+    *,
+    system_prompt: str | None = None,
+    model: str = "gpt-5.2",
+) -> str:
+    """Fetch URL, extract content, store with embeddings, return hash."""
+    text, traf_meta = fetch_text(url)
     
     # Store raw
     conn = connect(db_path)
     h = store_capture(conn, text, url, content_type="text/plain", storage_dir=storage_dir)
     
     # LLM extraction with hints
-    meta = extract_metadata(text, url=url, hints={
-        'title': traf_meta.get('title'),
-        'author': traf_meta.get('author'),
-        'date': traf_meta.get('date'),
-    })
+    meta = extract_metadata(
+        text,
+        url=url,
+        hints={
+            "title": traf_meta.get("title"),
+            "author": traf_meta.get("author"),
+            "date": traf_meta.get("date"),
+        },
+        system_prompt=system_prompt,
+        model=model,
+    )
     
     store_metadata(
         conn,

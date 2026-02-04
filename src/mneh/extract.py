@@ -94,7 +94,14 @@ Output: {
 Now extract from the following document. Respond with JSON only."""
 
 
-def extract_metadata(content: str, url: str | None = None, hints: dict | None = None) -> dict:
+def extract_metadata(
+    content: str,
+    url: str | None = None,
+    hints: dict | None = None,
+    *,
+    system_prompt: str | None = None,
+    model: str = "gpt-5.2",
+) -> dict:
     """Extract title, author, date, summary, handles."""
     client = OpenAI()
 
@@ -109,9 +116,9 @@ def extract_metadata(content: str, url: str | None = None, hints: dict | None = 
     user_content += f"Document:\n{content[:50000]}"
 
     response = client.chat.completions.create(
-        model="gpt-5.2",
+        model=model,
         messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "system", "content": system_prompt or SYSTEM_PROMPT},
             {"role": "user", "content": user_content},
         ],
         response_format={"type": "json_object"},
