@@ -1,7 +1,7 @@
 """Command-line interface.
 
 Commands:
-    mneh capture <url>              Ingest a URL
+    mneh capture <source>           Ingest a URL or arXiv reference
     mneh search <query>             Search the corpus
     mneh show <hash>                Inspect a capture
     mneh list                       List all captures
@@ -82,8 +82,8 @@ RRF Score Guide (with k=60, 4 channels):
     sub = parser.add_subparsers(dest="command", required=True)
 
     # capture
-    cap = sub.add_parser("capture", help="Capture a URL")
-    cap.add_argument("url", help="URL to capture")
+    cap = sub.add_parser("capture", help="Capture a URL or arXiv reference")
+    cap.add_argument("url", help="URL or arXiv reference (e.g. arXiv:2002.12327v3)")
     cap.add_argument(
         "--storage",
         type=Path,
@@ -141,7 +141,7 @@ RRF Score Guide (with k=60, 4 channels):
 
 
 def cmd_capture(args):
-    """Capture a URL."""
+    """Capture a URL or arXiv reference."""
     args.storage.mkdir(parents=True, exist_ok=True)
     h = capture_url(args.db, args.url, args.storage)
     print(f"Captured: {h[:8]}")

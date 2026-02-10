@@ -13,8 +13,10 @@ export OPENAI_API_KEY="..."
 ## Usage
 
 ```bash
-# Capture a URL
+# Capture a URL or arXiv reference
 mneh capture "https://example.com/article"
+mneh capture "arXiv:2002.12327v3"
+mneh capture "https://arxiv.org/abs/1706.03762"
 
 # Search
 mneh search "coordination failure game theory"
