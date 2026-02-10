@@ -94,6 +94,37 @@ Output: {
 Now extract from the following document. Respond with JSON only."""
 
 
+def normalize_extracted_metadata(payload: object) -> dict:
+    """Coerce model output to the expected metadata shape."""
+    base = {
+        "title": None,
+        "author": None,
+        "date": None,
+        "summary": None,
+        "handles": [],
+    }
+    if not isinstance(payload, dict):
+        return base
+
+    out = dict(base)
+    for field in ("title", "author", "date", "summary"):
+        value = payload.get(field)
+        if isinstance(value, str):
+            clean = value.strip()
+            out[field] = clean or None
+
+    raw_handles = payload.get("handles")
+    handles: list[str] = []
+    if isinstance(raw_handles, list):
+        for item in raw_handles:
+            if isinstance(item, str):
+                clean = item.strip()
+                if clean:
+                    handles.append(clean)
+    out["handles"] = handles
+    return out
+
+
 def extract_metadata(
     content: str,
     url: str | None = None,
@@ -122,4 +153,5 @@ def extract_metadata(
         response_format={"type": "json_object"},
     )
 
-    return json.loads(response.choices[0].message.content)
+    raw = json.loads(response.choices[0].message.content)
+    return normalize_extracted_metadata(raw)
