@@ -1,4 +1,4 @@
-from mneh.capture import ArxivRef, latex_to_plaintext, parse_arxiv_reference
+from mneh.capture import ArxivRef, latex_to_plaintext, normalize_handles, parse_arxiv_reference
 
 
 def test_parse_prefixed_new_style_id_with_version():
@@ -41,3 +41,20 @@ def test_latex_to_plaintext_keeps_readable_content():
     assert "This is the abstract with bold words." in text
     assert "Introduction" in text
     assert "E=mc^2" not in text
+
+
+def test_normalize_handles_uses_model_handles_when_present():
+    handles = normalize_handles([" alpha beta ", "Alpha Beta", "gamma delta"], "unused")
+    assert handles == ["alpha beta", "gamma delta"]
+
+
+def test_normalize_handles_falls_back_when_model_omits_handles():
+    text = """
+    Graph neural networks for molecules
+    Message passing architecture and atom featurization
+    Benchmarking on quantum chemistry datasets
+    Error analysis and ablation studies
+    """
+    handles = normalize_handles([], text)
+    assert handles
+    assert any("graph neural networks" in h.lower() for h in handles)

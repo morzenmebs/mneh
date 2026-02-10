@@ -7,6 +7,7 @@ import json
 import re
 import tarfile
 import xml.etree.ElementTree as ET
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlparse
@@ -29,6 +30,14 @@ ARXIV_OLD_ID = re.compile(
     r"^(?P<core>[a-z\-]+(?:\.[A-Z]{2})?/\d{7})(?P<version>v\d+)?$", re.IGNORECASE
 )
 ARXIV_PREFIXED = re.compile(r"^arxiv:(?P<id>.+)$", re.IGNORECASE)
+WORD_RE = re.compile(r"[A-Za-z][A-Za-z0-9\-]{2,}")
+STOPWORDS = {
+    "about", "after", "also", "among", "another", "because", "being", "between", "could",
+    "does", "during", "each", "from", "have", "into", "more", "most", "other", "over",
+    "same", "some", "such", "than", "that", "their", "there", "these", "they", "this",
+    "those", "through", "under", "using", "very", "what", "when", "where", "which", "with",
+    "without", "would", "your", "while", "were", "been", "them", "then", "here", "however",
+}
 
 
 @dataclass(frozen=True)
@@ -163,6 +172,66 @@ def fetch_arxiv_text(ref: ArxivRef) -> tuple[str, dict]:
     return text, meta
 
 
+def _clean_handle(s: str) -> str:
+    return re.sub(r"\s+", " ", s.strip(" -_,.;:\n\t")).strip()
+
+
+def _fallback_handles_from_text(text: str, max_handles: int = 16) -> list[str]:
+    """Generate retrieval handles when the metadata model omits them."""
+    lines = [ln.strip() for ln in re.split(r"[\n\r]+", text) if ln.strip()]
+    sentence_candidates: list[str] = []
+    for ln in lines[:200]:
+        ln = re.sub(r"\s+", " ", ln)
+        words = ln.split()
+        if 3 <= len(words) <= 12:
+            sentence_candidates.append(ln)
+        if len(sentence_candidates) >= max_handles:
+            break
+
+    tokens = [t.lower() for t in WORD_RE.findall(text[:30000])]
+    freq = Counter(t for t in tokens if t not in STOPWORDS)
+    keyword_candidates = [w for w, _ in freq.most_common(40)]
+
+    handles: list[str] = []
+    seen: set[str] = set()
+    for candidate in sentence_candidates + keyword_candidates:
+        handle = _clean_handle(candidate)
+        if not handle:
+            continue
+        key = handle.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        handles.append(handle)
+        if len(handles) >= max_handles:
+            break
+    return handles
+
+
+def normalize_handles(raw_handles: object, text: str) -> list[str]:
+    """Normalize model-provided handles and backfill if missing/empty."""
+    handles: list[str] = []
+    if isinstance(raw_handles, list):
+        for item in raw_handles:
+            if isinstance(item, str):
+                clean = _clean_handle(item)
+                if clean:
+                    handles.append(clean)
+
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for handle in handles:
+        key = handle.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(handle)
+
+    if deduped:
+        return deduped
+    return _fallback_handles_from_text(text)
+
+
 def fetch_text(source: str) -> tuple[str, dict, str]:
     """Fetch a source and return (text, metadata_hints, canonical_source_uri)."""
     arxiv_ref = parse_arxiv_reference(source)
@@ -225,7 +294,7 @@ def capture_url(db_path: Path, source: str, storage_dir: Path) -> str:
     chunks = chunk_text(text)
     store_chunks(conn, h, chunks)
 
-    handles = meta.get("handles") or []
+    handles = normalize_handles(meta.get("handles"), text)
     store_handles(conn, h, handles, style="llm")
 
     # Clear any existing embeddings (for re-capture case)
